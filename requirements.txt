@@ -3,3 +3,5 @@ llama-cpp-python
 huggingface-hub[cli]
 nvidia-cuda-runtime-cu12
 nvidia-cublas-cu12
+langgraph
+langchain-core
