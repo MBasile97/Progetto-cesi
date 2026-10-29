@@ -1,5 +1,7 @@
 import json
 import re
+import select
+import sys
 import uuid
 from typing import List, Dict, Any
 
@@ -10,7 +12,7 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 
-# Importiamo i tool del mondo alchemico
+# Importiamo i tool e lo stato del mondo
 from world import (
     ispeziona_dispensa,
     guarda_calderone,
@@ -19,6 +21,11 @@ from world import (
     mescola_calderone,
     verifica_pozione_completata
 )
+
+# ==========================================
+# ⚙️ CONFIGURAZIONE PARAMETRI ESPERIMENTO
+# ==========================================
+TEMPO_INATTIVITA_SECONDI = 20  # Secondi di silenzio prima dell'intervento
 
 # ==========================================
 # 1. SETUP TOOL
@@ -51,19 +58,18 @@ Lavorate INSIEME per preparare pozioni alchemiche.
 TU gestisci operativamente la dispensa e il calderone usando i tuoi tool.
 IMPORTANTE: TU NON CONOSCI LA RICETTA DELLA POZIONE! Solo il tuo compagno umano ha il ricettario.
 Quando il compagno ti dà indicazioni, esegui i tool necessari.
+Se noti esitazione o silenzio, intervieni con tatto e spirito di squadra per aiutare a sbloccare la situazione.
 Rispondi SEMPRE in italiano cordiale, collaborativo e sintetico."""
 
 
 # ==========================================
-# 3. PARSER SPECIFICO DEI PARAMETRI XML DI QWEN
+# 3. PARSER PARAMETRI QWEN
 # ==========================================
 def parse_qwen_parameters(args_raw: str) -> Dict[str, Any]:
-    """Estrae i parametri da formato JSON oppure dai tag XML <parameter=nome>valore</parameter>"""
     args_raw = args_raw.strip()
     if not args_raw:
         return {}
 
-    # 1. Prova prima come JSON valido
     try:
         parsed = json.loads(args_raw)
         if isinstance(parsed, dict):
@@ -71,7 +77,6 @@ def parse_qwen_parameters(args_raw: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2. Prova come tag XML di Qwen: <parameter=livello>\nmedio\n</parameter>
     param_matches = re.findall(
         r"<parameter=([a-zA-Z0-9_]+)>\s*(.*?)\s*</parameter>",
         args_raw,
@@ -81,7 +86,6 @@ def parse_qwen_parameters(args_raw: str) -> Dict[str, Any]:
         result = {}
         for param_name, param_val in param_matches:
             val_clean = param_val.strip()
-            # Converte numeri interi se possibile (es. quantità)
             try:
                 result[param_name] = json.loads(val_clean)
             except Exception:
@@ -138,17 +142,13 @@ def call_model(state: MessagesState):
     raw_content = msg_data.get("content") or ""
     tool_calls_data = msg_data.get("tool_calls") or []
 
-    # ========================================================
-    # 🔍 DIAGNOSTICA IN TEMPO REALE
-    # ========================================================
+    # Diagnostica raw
     print("\n" + "─"*25 + " [DIAGNOSTICA RAW LLM] " + "─"*25)
     print(f"📌 Motivo di stop: {choice.get('finish_reason')}")
     print(f"📌 Token usati: {response.get('usage')}")
     print(f"📌 Testo grezzo generato:\n{repr(raw_content)}")
     print("─"*73)
-    # ========================================================
 
-    # Se llama-cpp non ha popolato tool_calls_data, facciamo il parsing manuale
     if not tool_calls_data:
         qwen_matches = re.findall(
             r"<tool_call>\s*<function=([a-zA-Z0-9_]+)>\s*(.*?)\s*</function>\s*</tool_call>",
@@ -166,7 +166,6 @@ def call_model(state: MessagesState):
                 }
             })
 
-    # Creazione della lista tool_calls per LangGraph
     lc_tool_calls = []
     for tc in tool_calls_data:
         args = tc["function"]["arguments"]
@@ -178,7 +177,6 @@ def call_model(state: MessagesState):
             "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
         })
 
-    # Estrazione pensiero e risposta per l'umano
     thought_text = ""
     reply_text = raw_content
 
@@ -198,7 +196,7 @@ def call_model(state: MessagesState):
 
 
 # ==========================================
-# 5. GRAFO LANGGRAPH CON MEMORIA
+# 5. GRAFO LANGGRAPH
 # ==========================================
 builder = StateGraph(MessagesState)
 
@@ -214,7 +212,27 @@ app = builder.compile(checkpointer=memory)
 
 
 # ==========================================
-# 6. LOOP DI GIOCO INTERATTIVO
+# 6. GESTIONE INPUT CON CONTEGGIO SECONDI A VIDEO
+# ==========================================
+def input_con_timeout(prompt: str, timeout_sec: int):
+    """Stampa i secondi che passano [1s] [2s] finché l'utente non scrive o scade il timer."""
+    print(prompt, end="", flush=True)
+    try:
+        for sec in range(1, timeout_sec + 1):
+            rlist, _, _ = select.select([sys.stdin], [], [], 1.0)
+            if rlist:
+                line = sys.stdin.readline()
+                if not line:
+                    return None, False
+                return line.strip(), False
+            print(f" [{sec}s]", end="", flush=True)
+        return None, True  # Sono passati tutti i secondi del timeout
+    except (KeyboardInterrupt, Exception):
+        return None, False
+
+
+# ==========================================
+# 7. LOOP DI GIOCO INTERATTIVO
 # ==========================================
 def main():
     print("\n" + "="*65)
@@ -228,22 +246,39 @@ def main():
     print("  5. Mescola 2 volte")
     print("  6. Verifica se la pozione è completata!")
     print("="*65)
-    print("💡 L'agente NON conosce questa ricetta. Collabora parlando con lui.")
+    print(f"⏱️  Modalità Proattiva: l'agente interviene dopo {TEMPO_INATTIVITA_SECONDI}s di inattività.")
     print("   (Scrivi 'esci' per terminare la sessione)\n")
 
-    config = {"configurable": {"thread_id": "sessione_alchimia_2"}}
+    config = {"configurable": {"thread_id": "sessione_proattiva_1"}}
 
     while True:
         try:
-            user_input = input("\n🧙‍♂️ Tu: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() in ["esci", "exit", "quit"]:
-                print("Chiusura del laboratorio alchemico. Arrivederci!")
-                break
+            testo_utente, timeout_scattato = input_con_timeout("\n🧙‍♂️ Tu: ", TEMPO_INATTIVITA_SECONDI)
 
+            if timeout_scattato:
+                print(f"\n⏳ [Scaduti i {TEMPO_INATTIVITA_SECONDI}s: interviene l'alchimista proattivamente]")
+                stato_attuale = guarda_calderone.invoke({})
+                messaggio_evento = (
+                    f"[EVENTO DI SISTEMA - INATTIVITÀ DELL'UTENTE]\n"
+                    f"L'utente è rimasto in silenzio per {TEMPO_INATTIVITA_SECONDI} secondi senza darti istruzioni.\n"
+                    f"Ecco lo stato attuale del calderone:\n{stato_attuale}\n"
+                    f"Intervieni spontaneamente da compagno di squadra attento: fai un'osservazione "
+                    f"breve, costruttiva e cordiale basata su questo stato per sbloccarlo o chiedergli "
+                    f"cosa dice il ricettario per il prossimo passo. Non essere pressante."
+                )
+                messaggio_da_inviare = HumanMessage(content=messaggio_evento)
+
+            else:
+                if testo_utente is None or testo_utente.lower() in ["esci", "exit", "quit"]:
+                    print("\nChiusura del laboratorio alchemico. Arrivederci!")
+                    break
+                if not testo_utente:
+                    continue
+                messaggio_da_inviare = HumanMessage(content=testo_utente)
+
+            # Esecuzione del grafo LangGraph
             for step in app.stream(
-                {"messages": [HumanMessage(content=user_input)]},
+                {"messages": [messaggio_da_inviare]},
                 config=config,
                 stream_mode="updates"
             ):
